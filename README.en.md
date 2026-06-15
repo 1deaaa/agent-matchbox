@@ -44,7 +44,7 @@ Each scope can have independent window limits and total limits.
 ### 4. Lower Ops Overhead
 
 - No extra Redis/OneAPI stack required
-- SQLite + SQLAlchemy persistence
+- SQLite + SQLAlchemy persistence by default; PostgreSQL can be enabled with `AGENT_MATCHBOX_DATABASE_URL`
 - GUI management tool included
 
 ---
@@ -134,13 +134,15 @@ This prevents hosted budget exhaustion from blocking user self-paid traffic.
 Matchbox uses a dual-source model with clear authority.
 
 - Runtime source of truth: `llm_config.db`
-- Bootstrap/incremental sync/export: `matchbox_cfg.yaml`
+- Bootstrap/incremental sync/export:
+  - `matchbox_cfg.yaml` for platform/model structures
+  - `matchbox_key.yaml` for platform API keys (uses `base_url` as unique key, must be gitignored)
 
 Important:
 
 1. YAML initializes structures; runtime reads from DB.
 2. GUI edits write directly to DB.
-3. If historical `ENC:` keys cannot be decrypted in a new environment, platform/model structures still sync; replace keys locally.
+3. If historical `ENC:` keys in `matchbox_key.yaml` cannot be decrypted in a new environment, platform/model structures still sync; replace keys locally.
 
 ---
 
@@ -162,6 +164,7 @@ python matchbox_cfg_gui.py
 ## Security Guidelines
 
 - Do not commit plaintext API keys
+- Keep `matchbox_key.yaml` private and gitignored; it stores platform API keys
 - Prefer environment variables + encrypted DB storage
 - Keep `.env` private
 - Rotate hosted keys on environment migration
