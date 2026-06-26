@@ -1,6 +1,6 @@
 # Matchbox Agent Gateway: Embedded LLM Gateway for Agent Systems
 
-[简体中文](README.md) | [English](README.en.md) | [日本語](README.ja.md)
+[简体中文](README.md) | [English](README.en.md) 
 
 Matchbox is a full-featured gateway designed for agent-native applications.
 It is embedded directly into your app runtime, so model routing, key isolation, quotas, and usage analytics all happen where your agents run.

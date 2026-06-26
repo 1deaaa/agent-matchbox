@@ -23,7 +23,7 @@ from sqlalchemy.orm import (
 Base = declarative_base()
 
 
-DEFAULT_MAX_CONTEXT_TOKENS = 200_000
+DEFAULT_MAX_CONTEXT_TOKENS = 256_000
 DEFAULT_MAX_OUTPUT_TOKENS = 64_000
 
 
@@ -34,6 +34,8 @@ class LLMPlatform(Base):
     name = Column(String(80), default="未命名平台", index=True)
     user_id = Column(String(255), nullable=True, index=True)
     base_url = Column(String(255), nullable=False)
+    # 平台充值入口；为空时前端不显示低频充值按钮。
+    recharge_url = Column(String(512), nullable=True)
     api_key = Column(String(512), nullable=True)
     is_sys = Column(Integer, default=0) 
     disable = Column(Integer, default=0)
