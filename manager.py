@@ -31,6 +31,11 @@ from .models import (
     Base, LLMPlatform, LLModels, LLMSysPlatformKey,
     UserModelUsage, AgentModelBinding, ModelUsageStats, UserEmbeddingSelection,
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
+    get_model_capabilities,
+    is_chat_model,
+    is_embedding_model,
+    normalize_model_capabilities,
+    set_model_capabilities,
 )
 from .config import (
     DEFAULT_PLATFORM_CONFIGS, SYSTEM_USER_ID, DEFAULT_USAGE_KEY,
@@ -44,6 +49,12 @@ from .config import (
     is_api_key_placeholder,
 )
 from .env_utils import get_env_var
+from .image_adapters import (
+    DEFAULT_IMAGE_GENERATION_ADAPTER,
+    extract_legacy_image_generation_adapter,
+    normalize_image_generation_adapter,
+    strip_internal_image_generation_fields,
+)
 from .paths import get_db_file_path, get_state_file_path, get_config_file_path, get_key_file_path, get_mgr_home
 from .security import SecurityManager
 from .utils import normalize_recharge_url
@@ -287,12 +298,28 @@ class AIManagerBase:
         self.ensure_database_schema()
         self.initialize_defaults(ensure_schema=False)
 
+    def _backfill_model_capabilities(self) -> None:
+        """为旧数据库中缺失 capabilities 的模型补齐能力集合。"""
+        with self.Session() as session:
+            changed = False
+            for model in session.query(LLModels).all():
+                if getattr(model, "capabilities", None):
+                    continue
+                set_model_capabilities(
+                    model,
+                    None,
+                    legacy_is_embedding=bool(getattr(model, "is_embedding", 0)),
+                )
+                changed = True
+            if changed:
+                session.commit()
+
     def _resolve_default_ids_from_db(self, session) -> None:
         """从数据库 sort_order 确定默认平台 ID 和默认模型 ID。
 
         优先级：
         1. 数据库中 sort_order 最小的未禁用系统平台
-        2. 该平台内 sort_order 最小的未禁用非 Embedding 模型
+        2. 该平台内 sort_order 最小的未禁用文本生成模型
         """
         from sqlalchemy.orm import selectinload
 
@@ -310,7 +337,7 @@ class AIManagerBase:
 
         sorted_models = sorted(default_plat.models, key=lambda m: m.sort_order)
         default_model = next(
-            (m for m in sorted_models if not m.is_embedding and not self._is_model_disabled(m)),
+            (m for m in sorted_models if is_chat_model(m) and not self._is_model_disabled(m)),
             None,
         )
         if not default_model:
@@ -326,6 +353,7 @@ class AIManagerBase:
         self._ensure_sys_platform_keys_unique_constraint()
 
         self._sync_default_platforms()
+        self._backfill_model_capabilities()
 
         with self.Session() as session:
             self._resolve_default_ids_from_db(session)
@@ -365,12 +393,20 @@ class AIManagerBase:
                 model_name = model_config
                 extra_body = None
                 temperature = None
-                is_embedding = 0
+                capabilities = normalize_model_capabilities()
+                image_generation_adapter = None
             elif isinstance(model_config, dict):
                 model_name = model_config.get("model_name")
                 extra_body = model_config.get("extra_body")
                 temperature = model_config.get("temperature")
-                is_embedding = 1 if model_config.get("is_embedding") else 0
+                capabilities = normalize_model_capabilities(
+                    model_config.get("capabilities"),
+                    legacy_is_embedding=bool(model_config.get("is_embedding")),
+                )
+                image_generation_adapter = (
+                    normalize_image_generation_adapter(model_config.get("image_generation_adapter"))
+                    or extract_legacy_image_generation_adapter(extra_body)
+                )
             else:
                 continue
 
@@ -378,11 +414,15 @@ class AIManagerBase:
                 continue
 
             max_context_tokens, max_output_tokens = self._resolve_seed_model_limits(model_config)
+            cleaned_extra_body = strip_internal_image_generation_fields(extra_body)
+            if "image_generation" in capabilities and not image_generation_adapter:
+                image_generation_adapter = DEFAULT_IMAGE_GENERATION_ADAPTER
             specs.append({
                 "display_name": display_name,
                 "model_name": model_name,
-                "is_embedding": is_embedding,
-                "extra_body_json": json.dumps(extra_body) if extra_body else None,
+                "capabilities": capabilities,
+                "extra_body_json": json.dumps(cleaned_extra_body) if cleaned_extra_body else None,
+                "image_generation_adapter": image_generation_adapter if "image_generation" in capabilities else None,
                 "temperature": temperature,
                 "max_context_tokens": max_context_tokens,
                 "max_output_tokens": max_output_tokens,
@@ -399,7 +439,7 @@ class AIManagerBase:
         matched_pairs: Dict[int, LLModels] = {}
         matched_db_ids: set[int] = set()
 
-        # 第一阶段：完美匹配 (display_name, model_name, is_embedding)
+        # 第一阶段：完美匹配 (display_name, model_name, capabilities)
         for idx, seed in enumerate(seed_models):
             for db_model in db_models_pool:
                 if db_model.id in matched_db_ids:
@@ -407,7 +447,7 @@ class AIManagerBase:
                 if (
                     db_model.display_name == seed["display_name"]
                     and db_model.model_name == seed["model_name"]
-                    and db_model.is_embedding == seed["is_embedding"]
+                    and get_model_capabilities(db_model) == seed["capabilities"]
                 ):
                     matched_pairs[idx] = db_model
                     matched_db_ids.add(db_model.id)
@@ -420,24 +460,24 @@ class AIManagerBase:
             for db_model in db_models_pool:
                 if db_model.id in matched_db_ids:
                     continue
-                if db_model.display_name == seed["display_name"] and db_model.is_embedding == seed["is_embedding"]:
+                if db_model.display_name == seed["display_name"] and get_model_capabilities(db_model) == seed["capabilities"]:
                     matched_pairs[idx] = db_model
                     matched_db_ids.add(db_model.id)
                     break
 
-        # 第三阶段：唯一 model_name + is_embedding 改名匹配。
-        seed_key_counter = Counter((seed["model_name"], seed["is_embedding"]) for seed in seed_models)
+        # 第三阶段：唯一 model_name + capabilities 改名匹配。
+        seed_key_counter = Counter((seed["model_name"], tuple(seed["capabilities"])) for seed in seed_models)
         for idx, seed in enumerate(seed_models):
             if idx in matched_pairs:
                 continue
-            key = (seed["model_name"], seed["is_embedding"])
+            key = (seed["model_name"], tuple(seed["capabilities"]))
             if seed_key_counter[key] != 1:
                 continue
             candidates = [
                 db_model for db_model in db_models_pool
                 if db_model.id not in matched_db_ids
                 and db_model.model_name == seed["model_name"]
-                and db_model.is_embedding == seed["is_embedding"]
+                and get_model_capabilities(db_model) == seed["capabilities"]
             ]
             if len(candidates) == 1:
                 db_model = candidates[0]
@@ -452,7 +492,7 @@ class AIManagerBase:
                 db_model for db_model in db_models_pool
                 if db_model.id not in matched_db_ids
                 and db_model.model_name == seed["model_name"]
-                and db_model.is_embedding == seed["is_embedding"]
+                and get_model_capabilities(db_model) == seed["capabilities"]
             ]
             best_match = next(
                 (candidate for candidate in candidates if candidate.extra_body == seed["extra_body_json"]),
@@ -469,26 +509,30 @@ class AIManagerBase:
         """把 YAML 模型规格写回已有数据库模型。"""
         model.display_name = spec["display_name"]
         model.extra_body = spec["extra_body_json"]
+        model.image_generation_adapter = spec.get("image_generation_adapter")
         model.temperature = spec["temperature"]
         model.max_context_tokens = spec["max_context_tokens"]
         model.max_output_tokens = spec["max_output_tokens"]
+        set_model_capabilities(model, spec["capabilities"])
         if sync_order:
             model.sort_order = spec["sort_order"]
 
     @staticmethod
     def _create_seed_model(platform_id: int, spec: Dict[str, Any], *, sort_order: int) -> LLModels:
         """根据 YAML 模型规格创建数据库模型对象。"""
-        return LLModels(
+        model = LLModels(
             platform_id=platform_id,
             model_name=spec["model_name"],
             display_name=spec["display_name"],
             extra_body=spec["extra_body_json"],
+            image_generation_adapter=spec.get("image_generation_adapter"),
             temperature=spec["temperature"],
             max_context_tokens=spec["max_context_tokens"],
             max_output_tokens=spec["max_output_tokens"],
-            is_embedding=spec["is_embedding"],
             sort_order=sort_order,
         )
+        set_model_capabilities(model, spec["capabilities"])
+        return model
 
     def _sync_seed_models_for_platform(
         self,
@@ -990,14 +1034,23 @@ class AIManagerBase:
                         and int(model.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS) == DEFAULT_MAX_OUTPUT_TOKENS
                     )
 
-                    if not model.extra_body and not model.is_embedding and model.temperature is None and has_default_limits:
+                    capabilities = get_model_capabilities(model)
+                    if not model.extra_body and capabilities == ["text_generation"] and model.temperature is None and has_default_limits:
                         # 简单形式：DisplayName -> ModelID 字符串
                         plat_config["models"][model.display_name] = model.model_name
                     else:
                         entry: Dict[str, Any] = {"model_name": model.model_name}
+                        entry["capabilities"] = capabilities
+                        image_generation_adapter = normalize_image_generation_adapter(
+                            getattr(model, "image_generation_adapter", None)
+                        )
+                        if "image_generation" in capabilities and image_generation_adapter:
+                            entry["image_generation_adapter"] = image_generation_adapter
                         if model.extra_body:
                             try:
-                                entry["extra_body"] = json.loads(model.extra_body)
+                                cleaned_extra_body = strip_internal_image_generation_fields(json.loads(model.extra_body))
+                                if cleaned_extra_body:
+                                    entry["extra_body"] = cleaned_extra_body
                             except Exception:
                                 pass
                         if model.temperature is not None:
@@ -1005,8 +1058,6 @@ class AIManagerBase:
                         if not has_default_limits:
                             entry["max_context_tokens"] = int(model.max_context_tokens or DEFAULT_MAX_CONTEXT_TOKENS)
                             entry["max_output_tokens"] = int(model.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS)
-                        if model.is_embedding:
-                            entry["is_embedding"] = True
                         if model.sys_credit_input_price_per_million is not None:
                             entry["sys_credit_input_price_per_million"] = model.sys_credit_input_price_per_million
                         if model.sys_credit_cached_input_price_per_million is not None:
@@ -1240,6 +1291,40 @@ class AIManagerBase:
             .first()
         )
 
+    @staticmethod
+    def _get_request_caller_context() -> tuple[Optional[str], bool]:
+        """读取 Web 请求注入的调用者身份；Matchbox 本身不反向依赖用户表。"""
+        try:
+            from core.request_context import current_user_id, current_user_is_admin
+        except Exception:
+            return None, False
+        caller_user_id = current_user_id.get()
+        return (str(caller_user_id) if caller_user_id is not None else None), bool(current_user_is_admin.get())
+
+    def _is_system_hosted_key_owner_call(self, user_id: str) -> bool:
+        """判断本次调用是否是站长本人使用自己的系统托管 Key。"""
+        caller_user_id, caller_is_admin = self._get_request_caller_context()
+        if not caller_is_admin or caller_user_id is None:
+            return False
+        return str(caller_user_id) == str(user_id)
+
+    def _can_use_system_hosted_key(self, user_id: str) -> bool:
+        """系统托管 Key 的唯一访问策略。
+
+        这里刻意区分三种主体：
+        1. SYSTEM_USER_ID(-1)：内部系统/单用户模式，天然可用托管 Key。
+        2. 站长真人账号：即使关闭“向全体用户共享”，也应能使用自己配置的托管 Key。
+        3. 普通用户：只有 llm_auto_key 开启时，才可回退到托管 Key。
+
+        不要把管理员 user_id 改写成 -1，也不要复制一份 Key 到个人密钥表。
+        那会污染用途配置、Agent 绑定、用量统计和计费归属，形成难以维护的补丁扩散。
+        """
+        if str(user_id) == SYSTEM_USER_ID:
+            return True
+        if self._is_system_hosted_key_owner_call(str(user_id)):
+            return True
+        return bool(self.llm_auto_key)
+
     def _ensure_usage_slot(
         self,
         session,
@@ -1286,9 +1371,10 @@ class AIManagerBase:
         return created
 
     def _get_effective_api_access(self, session, user_id: str, platform: LLMPlatform) -> Dict[str, Optional[str]]:
-        """解析用户当前实际命中的 API Key 及其计费范围。"""
+        """解析用户当前实际命中的 API Key、来源及其计费范围。"""
         api_key = None
         quota_scope = None
+        key_source = None
         sec_mgr = SecurityManager.get_instance()
 
         if platform.is_sys:
@@ -1300,20 +1386,24 @@ class AIManagerBase:
                 api_key = sec_mgr.decrypt(cred.api_key).to_optional_plaintext()
                 if api_key:
                     quota_scope = "self_paid"
+                    key_source = "user_override"
 
-            if not api_key and (user_id == SYSTEM_USER_ID or self.llm_auto_key):
+            if not api_key and self._can_use_system_hosted_key(str(user_id)):
                 if platform.api_key:
                     api_key = sec_mgr.decrypt(platform.api_key).to_optional_plaintext()
                     if api_key:
                         quota_scope = "sys_paid"
+                        key_source = "system_hosted"
         else:
             api_key = sec_mgr.decrypt(platform.api_key).to_optional_plaintext()
             if api_key:
                 quota_scope = "self_paid"
+                key_source = "custom_platform"
 
         return {
             "api_key": api_key,
             "quota_scope": quota_scope,
+            "key_source": key_source,
         }
 
     def _get_effective_api_key(self, session, user_id: str, platform: LLMPlatform) -> Optional[str]:
@@ -1407,7 +1497,14 @@ class AIManagerBase:
             
             # 如果没有覆盖，则尝试从数据库查找模型配置以获取 extra_body
             if extra_body is None:
-                model_obj = session.query(LLModels).filter_by(platform_id=platform_id, model_name=model_name).first()
+                model_obj = next(
+                    (
+                        model
+                        for model in session.query(LLModels).filter_by(platform_id=platform_id, model_name=model_name).all()
+                        if is_chat_model(model) and not self._is_model_disabled(model)
+                    ),
+                    None,
+                )
                 if model_obj and model_obj.extra_body:
                     try:
                         extra_body = json.loads(model_obj.extra_body)
@@ -1444,7 +1541,14 @@ class AIManagerBase:
                 raise ValueError("无权访问此平台")
 
             # 尝试查找模型配置以获取 extra_body
-            model_obj = session.query(LLModels).filter_by(platform_id=platform_id, model_name=model_name).first()
+            model_obj = next(
+                (
+                    model
+                    for model in session.query(LLModels).filter_by(platform_id=platform_id, model_name=model_name).all()
+                    if is_chat_model(model) and not self._is_model_disabled(model)
+                ),
+                None,
+            )
             if model_obj and model_obj.extra_body:
                 try:
                     extra_body = json.loads(model_obj.extra_body)
