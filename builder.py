@@ -32,7 +32,7 @@ from .models import (
     UserEmbeddingSelection,
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_MAX_OUTPUT_TOKENS,
-    get_model_capabilities,
+    get_model_modalities,
     is_chat_model,
     is_embedding_model,
     is_image_generation_model,
@@ -40,7 +40,6 @@ from .models import (
 from .config import SYSTEM_USER_ID, DEFAULT_USAGE_KEY
 from .image_adapters import (
     DEFAULT_IMAGE_GENERATION_ADAPTER,
-    extract_legacy_image_generation_adapter,
     normalize_image_generation_adapter,
     strip_internal_image_generation_fields,
 )
@@ -61,9 +60,9 @@ class LLMBuilderMixin:
     """LLM 客户端构建功能"""
 
     @staticmethod
-    def _agent_default_usage_key(agent_name: Optional[str]) -> Optional[str]:
+    def _agent_default_usage_key(agent_name: Optional[str]) -> str:
         """返回没有显式绑定时的 Agent 默认用途。"""
-        return DIRECTOR_DEFAULT_USAGE_KEY if agent_name == "agent_director" else None
+        return DIRECTOR_DEFAULT_USAGE_KEY if agent_name == "agent_director" else DEFAULT_USAGE_KEY
 
     def _apply_sdk_request_compat(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """为 LangChain/OpenAI SDK 调用补充兼容参数。"""
@@ -238,7 +237,7 @@ class LLMBuilderMixin:
         1. agent_name: 业务首选。从数据库查询该 Agent 的绑定配置。
         2. platform_id & model_id: 直接指定特定的平台和模型 ID。
         3. usage_key: 明确指定用途槽位（如 'main', 'fast'）。
-        4. 默认值: 如果以上均未提供，使用 'main' 用途。
+        4. 默认值: Director 使用 'reason'，其他调用使用 'main'。
 
         用法示例:
             # 流式调用
@@ -275,7 +274,9 @@ class LLMBuilderMixin:
                             'model_id': binding.model_id
                         }
                     else:
-                        normalized_usage = self._normalize_usage_key(binding.usage_key)
+                        normalized_usage = self._normalize_usage_key(
+                            binding.usage_key or self._agent_default_usage_key(agent_name)
+                        )
 
             # 2. 处理直接指定的 ID
             if not direct_config and not normalized_usage:
@@ -288,7 +289,7 @@ class LLMBuilderMixin:
             # 3. 处理 usage_key (如果以上均未提供)
             if not direct_config and not normalized_usage:
                 normalized_usage = self._normalize_usage_key(
-                    usage_key if usage_key is not None else self._agent_default_usage_key(agent_name)
+                    usage_key or self._agent_default_usage_key(agent_name)
                 )
 
             # 4. 解析最终的 platform_id 和 model_id
@@ -297,17 +298,17 @@ class LLMBuilderMixin:
                 platform_id = direct_config.get('platform_id')
                 model_id = direct_config.get('model_id')
                 
-                # 如果 direct 配置不完整，强制回退到 main 槽位以保证可用性
+                # 如果 direct 配置不完整，回退到该 Agent 的默认用途以保证可用性
                 if not platform_id or not model_id:
-                    normalized_usage = DEFAULT_USAGE_KEY
+                    normalized_usage = self._agent_default_usage_key(agent_name)
                     usage_slot = self._get_usage_slot(session, effective_user_id, normalized_usage)
                     platform_id = usage_slot.selected_platform_id
                     model_id = usage_slot.selected_model_id
             else:
                 usage_slot = self._get_usage_slot(session, effective_user_id, normalized_usage)
                 if not usage_slot:
-                    # 兜底：如果指定的用途不存在，回退到 main
-                    normalized_usage = DEFAULT_USAGE_KEY
+                    # 兜底：如果指定的用途不存在，回退到该 Agent 的默认用途
+                    normalized_usage = self._agent_default_usage_key(agent_name)
                     usage_slot = self._get_usage_slot(session, effective_user_id, normalized_usage)
                 
                 platform_id = usage_slot.selected_platform_id
@@ -479,7 +480,7 @@ class LLMBuilderMixin:
                         "model_id": model.id,
                         "model_name": model.model_name,
                         "display_name": model.display_name or model.model_name,
-                        "capabilities": get_model_capabilities(model),
+                        **get_model_modalities(model),
                         "image_generation_adapter": (
                             normalize_image_generation_adapter(getattr(model, "image_generation_adapter", None))
                             or DEFAULT_IMAGE_GENERATION_ADAPTER
@@ -554,18 +555,15 @@ class LLMBuilderMixin:
             )
 
             extra_body: dict[str, Any] = {}
-            legacy_image_adapter = None
             if model.extra_body:
                 try:
                     parsed_extra = json.loads(model.extra_body)
                     if isinstance(parsed_extra, dict):
-                        legacy_image_adapter = extract_legacy_image_generation_adapter(parsed_extra)
                         extra_body = strip_internal_image_generation_fields(parsed_extra) or {}
                 except json.JSONDecodeError:
                     extra_body = {}
             image_generation_adapter = (
                 normalize_image_generation_adapter(getattr(model, "image_generation_adapter", None))
-                or legacy_image_adapter
                 or DEFAULT_IMAGE_GENERATION_ADAPTER
             )
 
@@ -579,7 +577,7 @@ class LLMBuilderMixin:
                 "display_name": model.display_name or model.model_name,
                 "api_key": api_key,
                 "quota_scope": quota_scope,
-                "capabilities": get_model_capabilities(model),
+                **get_model_modalities(model),
                 "image_generation_adapter": image_generation_adapter,
                 "extra_body": extra_body,
             }

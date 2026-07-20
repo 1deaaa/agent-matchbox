@@ -24,18 +24,19 @@ import time
 from collections import Counter
 from typing import Dict, Any, Optional, List
 
-from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker, selectinload
 
 from .models import (
-    Base, LLMPlatform, LLModels, LLMSysPlatformKey,
+    LLMPlatform, LLModels, LLMSysPlatformKey,
     UserModelUsage, AgentModelBinding, ModelUsageStats, UserEmbeddingSelection,
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
-    get_model_capabilities,
+    DEFAULT_MODEL_INPUT_MODALITIES, DEFAULT_MODEL_OUTPUT_MODALITIES,
+    MODALITY_IMAGE,
+    get_model_modalities,
     is_chat_model,
     is_embedding_model,
-    normalize_model_capabilities,
-    set_model_capabilities,
+    normalize_model_modalities,
+    set_model_modalities,
 )
 from .config import (
     DEFAULT_PLATFORM_CONFIGS, SYSTEM_USER_ID, DEFAULT_USAGE_KEY,
@@ -51,7 +52,6 @@ from .config import (
 from .env_utils import get_env_var
 from .image_adapters import (
     DEFAULT_IMAGE_GENERATION_ADAPTER,
-    extract_legacy_image_generation_adapter,
     normalize_image_generation_adapter,
     strip_internal_image_generation_fields,
 )
@@ -101,11 +101,6 @@ class AIManagerBase:
             default_sqlite_path=db_path,
         )
         self.engine = create_configured_engine(db_url, future=True)
-        # 注意：表创建现由 Alembic 迁移管理
-        # 首次部署时运行: cd server && alembic upgrade head -x db=llm
-        # 保留 create_all 以确保向后兼容（无 Alembic 环境时自动创建表）
-        # [FIX] 在 Alembic 运行时调用的 import 链中会导致死锁/占用，故注释掉。
-        # Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._sys_platforms_cache = None 
         self._cache_lock = threading.Lock()
@@ -118,147 +113,11 @@ class AIManagerBase:
         self._default_model_id = None
         self._builtin_usage_map = {slot["key"]: slot for slot in BUILTIN_USAGE_SLOTS}
         self._default_usage_key = DEFAULT_USAGE_KEY
-        self._sys_platform_keys_constraint_checked = False
         
         state_file_path = get_state_file_path()
         state_file_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_file = str(state_file_path)
         self._load_state()
-
-    def _has_sys_platform_keys_composite_unique(self, conn) -> bool:
-        """检测 llm_sys_platform_keys 是否具备 (user_id, platform_id) 复合唯一约束。"""
-        index_rows = conn.execute(text("PRAGMA index_list('llm_sys_platform_keys')")).fetchall()
-        for row in index_rows:
-            if len(row) < 3:
-                continue
-            index_name = row[1]
-            unique_flag = int(row[2])
-            if unique_flag != 1 or not index_name:
-                continue
-
-            safe_index_name = str(index_name).replace("'", "''")
-            col_rows = conn.execute(text(f"PRAGMA index_info('{safe_index_name}')")).fetchall()
-            cols = [str(c[2]) for c in col_rows if len(c) >= 3]
-            if len(cols) == 2 and set(cols) == {"user_id", "platform_id"}:
-                return True
-
-        return False
-
-    def _repair_sys_platform_keys_unique_constraint(self, conn) -> None:
-        """修复历史数据库中 llm_sys_platform_keys 缺失复合唯一约束的问题。"""
-        print("[startup-fix] Detected missing (user_id, platform_id) unique constraint on llm_sys_platform_keys, starting auto-fix")
-
-        rows = conn.execute(
-            text(
-                """
-                SELECT id, user_id, platform_id, api_key, disable
-                FROM llm_sys_platform_keys
-                ORDER BY id ASC
-                """
-            )
-        ).mappings().all()
-
-        deduped: Dict[tuple, Dict[str, Any]] = {}
-        for row in rows:
-            user_id = str(row["user_id"] or "")
-            platform_id = int(row["platform_id"])
-            candidate = {
-                "id": int(row["id"]),
-                "user_id": user_id,
-                "platform_id": platform_id,
-                "api_key": row["api_key"],
-                "disable": int(row["disable"] or 0),
-            }
-
-            key = (user_id, platform_id)
-            existing = deduped.get(key)
-            if existing is None:
-                deduped[key] = candidate
-                continue
-
-            # 同一 user+platform 出现重复历史脏数据时：优先保留有 key 的记录，其次保留最新 id。
-            existing_has_key = bool(existing.get("api_key"))
-            candidate_has_key = bool(candidate.get("api_key"))
-            if (not existing_has_key and candidate_has_key) or (
-                existing_has_key == candidate_has_key and candidate["id"] > existing["id"]
-            ):
-                deduped[key] = candidate
-
-        conn.execute(text("DROP TABLE IF EXISTS llm_sys_platform_keys__rebuild"))
-        conn.execute(
-            text(
-                """
-                CREATE TABLE llm_sys_platform_keys__rebuild (
-                    id INTEGER PRIMARY KEY,
-                    user_id VARCHAR(255) NOT NULL,
-                    platform_id INTEGER NOT NULL,
-                    api_key VARCHAR(512),
-                    disable INTEGER DEFAULT 0,
-                    FOREIGN KEY(platform_id) REFERENCES llm_platforms(id) ON DELETE CASCADE,
-                    CONSTRAINT uq_sys_platform_key_user_platform UNIQUE (user_id, platform_id)
-                )
-                """
-            )
-        )
-
-        if deduped:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO llm_sys_platform_keys__rebuild (id, user_id, platform_id, api_key, disable)
-                    VALUES (:id, :user_id, :platform_id, :api_key, :disable)
-                    """
-                ),
-                list(deduped.values()),
-            )
-
-        conn.execute(text("DROP TABLE llm_sys_platform_keys"))
-        conn.execute(text("ALTER TABLE llm_sys_platform_keys__rebuild RENAME TO llm_sys_platform_keys"))
-        conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_llm_sys_platform_keys_user_id "
-                "ON llm_sys_platform_keys (user_id)"
-            )
-        )
-        conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_llm_sys_platform_keys_platform_id "
-                "ON llm_sys_platform_keys (platform_id)"
-            )
-        )
-        print("[startup-fix] llm_sys_platform_keys constraint fix complete")
-
-    def _ensure_sys_platform_keys_unique_constraint(self, force: bool = False) -> None:
-        """确保系统平台用户密钥表具备 (user_id, platform_id) 复合唯一约束。"""
-        if self._sys_platform_keys_constraint_checked and not force:
-            return
-
-        if self.engine.dialect.name != "sqlite":
-            self._sys_platform_keys_constraint_checked = True
-            return
-
-        with self.engine.begin() as conn:
-            table_exists = conn.execute(
-                text(
-                    """
-                    SELECT 1 FROM sqlite_master
-                    WHERE type='table' AND name='llm_sys_platform_keys'
-                    LIMIT 1
-                    """
-                )
-            ).first()
-
-            if not table_exists:
-                self._sys_platform_keys_constraint_checked = True
-                return
-
-            if self._has_sys_platform_keys_composite_unique(conn):
-                self._sys_platform_keys_constraint_checked = True
-                return
-
-            self._repair_sys_platform_keys_unique_constraint(conn)
-
-        self._sys_platform_keys_constraint_checked = True
 
     def _load_state(self):
         """加载运行时状态"""
@@ -289,31 +148,6 @@ class AIManagerBase:
         except Exception as e:
             print(f"Failed to save state: {e}")
 
-    def ensure_database_schema(self):
-        """显式创建缺失的数据表。"""
-        Base.metadata.create_all(self.engine)
-
-    def ensure_database_ready(self):
-        """确保数据库与系统默认配置均已初始化。"""
-        self.ensure_database_schema()
-        self.initialize_defaults(ensure_schema=False)
-
-    def _backfill_model_capabilities(self) -> None:
-        """为旧数据库中缺失 capabilities 的模型补齐能力集合。"""
-        with self.Session() as session:
-            changed = False
-            for model in session.query(LLModels).all():
-                if getattr(model, "capabilities", None):
-                    continue
-                set_model_capabilities(
-                    model,
-                    None,
-                    legacy_is_embedding=bool(getattr(model, "is_embedding", 0)),
-                )
-                changed = True
-            if changed:
-                session.commit()
-
     def _resolve_default_ids_from_db(self, session) -> None:
         """从数据库 sort_order 确定默认平台 ID 和默认模型 ID。
 
@@ -321,8 +155,6 @@ class AIManagerBase:
         1. 数据库中 sort_order 最小的未禁用系统平台
         2. 该平台内 sort_order 最小的未禁用文本生成模型
         """
-        from sqlalchemy.orm import selectinload
-
         default_plat = (
             session.query(LLMPlatform)
             .options(selectinload(LLMPlatform.models))
@@ -345,15 +177,9 @@ class AIManagerBase:
 
         self._default_model_id = default_model.id
 
-    def initialize_defaults(self, ensure_schema: bool = True):
+    def initialize_defaults(self):
         """同步默认平台并初始化默认ID"""
-        if ensure_schema:
-            self.ensure_database_schema()
-
-        self._ensure_sys_platform_keys_unique_constraint()
-
         self._sync_default_platforms()
-        self._backfill_model_capabilities()
 
         with self.Session() as session:
             self._resolve_default_ids_from_db(session)
@@ -393,19 +219,18 @@ class AIManagerBase:
                 model_name = model_config
                 extra_body = None
                 temperature = None
-                capabilities = normalize_model_capabilities()
+                input_modalities, output_modalities = normalize_model_modalities()
                 image_generation_adapter = None
             elif isinstance(model_config, dict):
                 model_name = model_config.get("model_name")
                 extra_body = model_config.get("extra_body")
                 temperature = model_config.get("temperature")
-                capabilities = normalize_model_capabilities(
-                    model_config.get("capabilities"),
-                    legacy_is_embedding=bool(model_config.get("is_embedding")),
+                input_modalities, output_modalities = normalize_model_modalities(
+                    model_config.get("input_modalities"),
+                    model_config.get("output_modalities"),
                 )
                 image_generation_adapter = (
                     normalize_image_generation_adapter(model_config.get("image_generation_adapter"))
-                    or extract_legacy_image_generation_adapter(extra_body)
                 )
             else:
                 continue
@@ -415,14 +240,15 @@ class AIManagerBase:
 
             max_context_tokens, max_output_tokens = self._resolve_seed_model_limits(model_config)
             cleaned_extra_body = strip_internal_image_generation_fields(extra_body)
-            if "image_generation" in capabilities and not image_generation_adapter:
+            if MODALITY_IMAGE in output_modalities and not image_generation_adapter:
                 image_generation_adapter = DEFAULT_IMAGE_GENERATION_ADAPTER
             specs.append({
                 "display_name": display_name,
                 "model_name": model_name,
-                "capabilities": capabilities,
+                "input_modalities": input_modalities,
+                "output_modalities": output_modalities,
                 "extra_body_json": json.dumps(cleaned_extra_body) if cleaned_extra_body else None,
-                "image_generation_adapter": image_generation_adapter if "image_generation" in capabilities else None,
+                "image_generation_adapter": image_generation_adapter if MODALITY_IMAGE in output_modalities else None,
                 "temperature": temperature,
                 "max_context_tokens": max_context_tokens,
                 "max_output_tokens": max_output_tokens,
@@ -439,7 +265,14 @@ class AIManagerBase:
         matched_pairs: Dict[int, LLModels] = {}
         matched_db_ids: set[int] = set()
 
-        # 第一阶段：完美匹配 (display_name, model_name, capabilities)
+        def modalities_match(db_model: LLModels, seed: Dict[str, Any]) -> bool:
+            modalities = get_model_modalities(db_model)
+            return (
+                modalities["input_modalities"] == seed["input_modalities"]
+                and modalities["output_modalities"] == seed["output_modalities"]
+            )
+
+        # 第一阶段：完美匹配（显示名、模型名、输入/输出模态）
         for idx, seed in enumerate(seed_models):
             for db_model in db_models_pool:
                 if db_model.id in matched_db_ids:
@@ -447,7 +280,7 @@ class AIManagerBase:
                 if (
                     db_model.display_name == seed["display_name"]
                     and db_model.model_name == seed["model_name"]
-                    and get_model_capabilities(db_model) == seed["capabilities"]
+                    and modalities_match(db_model, seed)
                 ):
                     matched_pairs[idx] = db_model
                     matched_db_ids.add(db_model.id)
@@ -460,24 +293,35 @@ class AIManagerBase:
             for db_model in db_models_pool:
                 if db_model.id in matched_db_ids:
                     continue
-                if db_model.display_name == seed["display_name"] and get_model_capabilities(db_model) == seed["capabilities"]:
+                if db_model.display_name == seed["display_name"] and modalities_match(db_model, seed):
                     matched_pairs[idx] = db_model
                     matched_db_ids.add(db_model.id)
                     break
 
-        # 第三阶段：唯一 model_name + capabilities 改名匹配。
-        seed_key_counter = Counter((seed["model_name"], tuple(seed["capabilities"])) for seed in seed_models)
+        # 第三阶段：唯一 model_name + 模态组合改名匹配。
+        seed_key_counter = Counter(
+            (
+                seed["model_name"],
+                tuple(seed["input_modalities"]),
+                tuple(seed["output_modalities"]),
+            )
+            for seed in seed_models
+        )
         for idx, seed in enumerate(seed_models):
             if idx in matched_pairs:
                 continue
-            key = (seed["model_name"], tuple(seed["capabilities"]))
+            key = (
+                seed["model_name"],
+                tuple(seed["input_modalities"]),
+                tuple(seed["output_modalities"]),
+            )
             if seed_key_counter[key] != 1:
                 continue
             candidates = [
                 db_model for db_model in db_models_pool
                 if db_model.id not in matched_db_ids
                 and db_model.model_name == seed["model_name"]
-                and get_model_capabilities(db_model) == seed["capabilities"]
+                and modalities_match(db_model, seed)
             ]
             if len(candidates) == 1:
                 db_model = candidates[0]
@@ -492,7 +336,7 @@ class AIManagerBase:
                 db_model for db_model in db_models_pool
                 if db_model.id not in matched_db_ids
                 and db_model.model_name == seed["model_name"]
-                and get_model_capabilities(db_model) == seed["capabilities"]
+                and modalities_match(db_model, seed)
             ]
             best_match = next(
                 (candidate for candidate in candidates if candidate.extra_body == seed["extra_body_json"]),
@@ -513,7 +357,7 @@ class AIManagerBase:
         model.temperature = spec["temperature"]
         model.max_context_tokens = spec["max_context_tokens"]
         model.max_output_tokens = spec["max_output_tokens"]
-        set_model_capabilities(model, spec["capabilities"])
+        set_model_modalities(model, spec["input_modalities"], spec["output_modalities"])
         if sync_order:
             model.sort_order = spec["sort_order"]
 
@@ -531,7 +375,7 @@ class AIManagerBase:
             max_output_tokens=spec["max_output_tokens"],
             sort_order=sort_order,
         )
-        set_model_capabilities(model, spec["capabilities"])
+        set_model_modalities(model, spec["input_modalities"], spec["output_modalities"])
         return model
 
     def _sync_seed_models_for_platform(
@@ -854,8 +698,6 @@ class AIManagerBase:
             if current_key and current_key != new_key:
                 old_key = current_key
 
-        self.ensure_database_schema()
-
         # 平台结构来自 matchbox_cfg.yaml，密钥独立存放在 matchbox_key.yaml。
         key_yaml_data = load_key_yaml_raw()
         rewrite_jobs = []
@@ -1034,17 +876,22 @@ class AIManagerBase:
                         and int(model.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS) == DEFAULT_MAX_OUTPUT_TOKENS
                     )
 
-                    capabilities = get_model_capabilities(model)
-                    if not model.extra_body and capabilities == ["text_generation"] and model.temperature is None and has_default_limits:
+                    modalities = get_model_modalities(model)
+                    has_default_modalities = (
+                        modalities["input_modalities"] == list(DEFAULT_MODEL_INPUT_MODALITIES)
+                        and modalities["output_modalities"] == list(DEFAULT_MODEL_OUTPUT_MODALITIES)
+                    )
+                    if not model.extra_body and has_default_modalities and model.temperature is None and has_default_limits:
                         # 简单形式：DisplayName -> ModelID 字符串
                         plat_config["models"][model.display_name] = model.model_name
                     else:
                         entry: Dict[str, Any] = {"model_name": model.model_name}
-                        entry["capabilities"] = capabilities
+                        if not has_default_modalities:
+                            entry.update(modalities)
                         image_generation_adapter = normalize_image_generation_adapter(
                             getattr(model, "image_generation_adapter", None)
                         )
-                        if "image_generation" in capabilities and image_generation_adapter:
+                        if MODALITY_IMAGE in modalities["output_modalities"] and image_generation_adapter:
                             entry["image_generation_adapter"] = image_generation_adapter
                         if model.extra_body:
                             try:

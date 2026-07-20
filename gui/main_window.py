@@ -96,7 +96,10 @@ class LLMConfigGUI(
                 self.root.after(0, self.root.destroy)
                 return
 
-            self.ai_manager.ensure_database_ready()
+            from core.auto_migrate import run_db_upgrade
+
+            run_db_upgrade("llm", _SERVER_DIR)
+            self.ai_manager.initialize_defaults()
             self.load_config_from_db()
         except Exception as e:
             messagebox.showerror("初始化失败", f"GUI 启动失败: {e}")
@@ -720,8 +723,8 @@ class LLMConfigGUI(
                     display_name = m["display_name"]
                     model_cfg = {
                         "model_name": m["model_name"],
-                        "capabilities": m.get("capabilities", []),
-                        "is_embedding": bool(m["is_embedding"]),
+                        "input_modalities": m.get("input_modalities", ["text"]),
+                        "output_modalities": m.get("output_modalities", ["text"]),
                         "_db_id": m["_db_id"],
                         "max_context_tokens": m.get("max_context_tokens", 256000),
                         "max_output_tokens": m.get("max_output_tokens", 64000),
