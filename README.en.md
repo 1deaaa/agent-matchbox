@@ -144,7 +144,7 @@ To balance stability, maintainability, and extensibility, the Matchbox gateway a
 3. **Lifecycle Constraints**:
   - Initialize + warmup at startup, and call `reset_matchbo()` during shutdown to avoid side effects of import-time initialization.
 4. **Runtime Directory Governance**:
-  - Control the runtime location of DB/.env/YAML/state via the `AGENT_MATCHBOX_HOME` environment variable.
+  - DB/.env/YAML/state default to the Matchbox component root. A host can call `set_default_mgr_home(path)` before initialization to choose its own default, while the higher-priority `AGENT_MATCHBOX_HOME` environment variable remains available for deployment overrides.
 
 ### Recommended Flow (Developer Practice)
 
@@ -482,7 +482,7 @@ POST   /api/ai/admin/reload-from-yaml       # Force reload database from YAML
       While this does not prevent a motivated human or AI from decrypting the keys if both the master key (`LLM_KEY`) and the encrypted key file are leaked, it does successfully evade the vast majority of scenarios where a credential is accidentally committed, exposed in logs, or leaked as raw files, preventing automated bots from scanning the plaintext key.
 
 3. **Database Files**:
-    - By default, `llm_config.db` is generated in the user data directory (`%LOCALAPPDATA%/AgentMatchbox` on Windows, `$XDG_STATE_HOME/agent-matchbox` when available on other systems, otherwise `~/.agent-matchbox`). Set `AGENT_MATCHBOX_HOME` to choose an explicit runtime directory. This SQLite file contains all user data and synced system platform data. Protect it carefully.
+    - By default, `llm_config.db` is generated in the Matchbox component root. A host can call `set_default_mgr_home(path)` before initialization to choose its default directory, or use the higher-priority `AGENT_MATCHBOX_HOME` environment variable as an explicit deployment override. This SQLite file contains all user data and synced system platform data. Protect it carefully.
     - To use PostgreSQL, set `AGENT_MATCHBOX_DATABASE_URL=postgresql+psycopg://user:password@host:5432/dbname`. This variable belongs to the Matchbox component itself, making it easy to reuse across different projects.
 
 4. **Model Probing Failure?**:

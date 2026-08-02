@@ -146,7 +146,7 @@ Agent Matchbox 面向 Agent 开发而生，是一个可独立运行、可嵌入�
 3. **生命周期约束**：
   - 启动时初始化 + 预热，关闭阶段调用 `reset_matchbo()`，避免导入即初始化的副作用。
 4. **运行目录治理**：
-  - 通过 `AGENT_MATCHBOX_HOME` 统一指定 DB/.env/YAML/state 的运行位置。
+  - 默认从 Matchbox 组件根目录读取 DB/.env/YAML/state。宿主可在初始化前调用 `set_default_mgr_home(path)` 设置自己的默认目录；部署环境仍可通过优先级更高的 `AGENT_MATCHBOX_HOME` 显式覆盖。
 
 ### 推荐链路（开发者实践）
 
@@ -483,7 +483,7 @@ POST   /api/ai/admin/reload-from-yaml       # 从配置文件强制重置数据�
       如果发生了泄露，且主密钥（`LLM_KEY`）和加密后的密钥文件同时暴露，真人或有针对性的 AI 确实能够破解它。但这已经极大地增加了攻击者的成本，能够完美规避绝大多数普通泄露被自动化机器人直接扫出明文的情况。
 
 3. **数据库文件**
-    - 默认会在系统用户数据目录下生成 `llm_config.db`（Windows 为 `%LOCALAPPDATA%/AgentMatchbox`，其他系统优先使用 `$XDG_STATE_HOME/agent-matchbox`，最后回退到 `~/.agent-matchbox`）。可通过 `AGENT_MATCHBOX_HOME` 显式指定运行目录。该 SQLite 文件包含所有用户数据和同步后的系统平台数据，请妥善保管。
+    - 默认会在 Matchbox 组件根目录生成 `llm_config.db`。宿主可在初始化前调用 `set_default_mgr_home(path)` 设置默认目录，或通过优先级更高的 `AGENT_MATCHBOX_HOME` 显式指定运行目录。该 SQLite 文件包含所有用户数据和同步后的系统平台数据，请妥善保管。
     - 如需使用 PostgreSQL，设置 `AGENT_MATCHBOX_DATABASE_URL=postgresql+psycopg://user:password@host:5432/dbname`。该变量属于 Agent Matchbox 组件本身，方便在不同项目中复用。
 
 4. **模型探测失败？**

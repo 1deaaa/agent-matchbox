@@ -60,6 +60,7 @@ _LAZY_EXPORTS: dict[str, Tuple[str, str]] = {
     "LLM_AUTO_KEY": (".config", "LLM_AUTO_KEY"),
     "USE_SYS_LLM_CONFIG": (".config", "USE_SYS_LLM_CONFIG"),
     "MatchboxIntegrations": (".integrations", "MatchboxIntegrations"),
+    "set_default_mgr_home": (".paths", "set_default_mgr_home"),
 }
 
 
@@ -226,5 +227,6 @@ __all__ = [
     'LLM_AUTO_KEY',
     'USE_SYS_LLM_CONFIG',
     'MatchboxIntegrations',
+    'set_default_mgr_home',
 ]
 
